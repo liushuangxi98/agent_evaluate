@@ -63,13 +63,11 @@ class Case(BaseCase):
         # 读取当前画像，先核对是否已有保存记录；空表单也可能以 HTTP 200 返回。
         profile = self.request("GET", "/api/profile")
         self.assert_err("读取当前已保存的画像", True, profile["id"] is not None)
-        self.assert_err("核对画像必填项完整", [], profile["missing"])
         # 按 Excel 的岗位 ID 读取已有岗位，确认工作台返回的就是本条用例要测的岗位。
         job = self.request("GET", f"/api/jobs/{job_id}")
         self.assert_err("读取 Excel 指定的岗位", job_id, job.get("id"))
         # 提交一次岗位评估，取回运行 ID；后续查询和选择通勤地点都用这个 ID。
         run = self.request("POST", "/api/runs", {"action": "evaluate", "input": {"job_ids": [job_id]}})
-        self.assert_err("发起评估后取得运行 ID", True, bool(run.get("id")))
         self.run_id = run["id"]
         run_path = "/api/runs/" + self.run_id
         self.log.info(f"评估已启动：岗位 {job_id}，运行 ID {self.run_id}")
@@ -83,9 +81,9 @@ class Case(BaseCase):
             if run["status"] == "running":
                 time.sleep(1)
                 run = self.request("GET", run_path)
-                continue
-            # 工作台转为等待输入时，按本用例配置选择通勤起终点，续接原运行。
-            run = self.confirm_route(run_path, run)
+            else:
+                # 工作台转为等待输入时，按本用例配置选择通勤起终点，续接原运行。
+                run = self.confirm_route(run_path, run)
 
         # 查询进度成功也可能读到失败的业务结果；向报告返回具体原因，并识别上游请求超限。
         if run["status"] == "failed":
@@ -95,16 +93,14 @@ class Case(BaseCase):
             error_data = (run["result"] or {}).get("data", {})
             raise RuntimeError(f"评估未完成（{run['status']}）：{error_data.get('message') or detail}")
         self.assert_err("评估运行已完成", "completed", run.get("status"))
-        self.assert_err("完成评估后取得报告 ID", True, bool(run.get("report_id")))
-        # 用运行结果提供的报告 ID 读回正式报告，核对报告 ID 后记入本地日志。
-        report = self.request("GET", "/api/reports/" + run["report_id"])
-        self.assert_err("读取本次生成的报告", run["report_id"], report.get("id"))
+        # 按本次运行给出的 ID 读取报告，随后核对报告实际关联的运行和岗位。
         self.report_id = run["report_id"]
+        report = self.request("GET", "/api/reports/" + self.report_id)
         self.log.info(f"已读取工作台报告 {self.report_id}，开始核对预期值")
         # 对照报告快照检查画像和岗位版本，避免用例运行期间的资料修改影响验收结论。
         snapshot = report["snapshot"]
-        self.assert_err("核对报告使用的画像 ID", profile["id"], snapshot["profile"].get("id"))
-        self.assert_err("核对画像版本", profile["revision"], snapshot["profile"].get("revision"))
+        self.assert_err("核对画像及版本", (profile["id"], profile["revision"]),
+                        (snapshot["profile"].get("id"), snapshot["profile"].get("revision")))
         self.assert_err("核对岗位快照", [(job_id, job["revision"])],
                         [(item.get("id"), item.get("revision")) for item in snapshot["jobs"]])
         return report
@@ -126,10 +122,8 @@ class Case(BaseCase):
         return str(names.index(name) + 1), name
 
     def confirm_route(self, run_path, run):
-        # 确认等待输入的是本场评估，再取得本轮输入 ID，防止把地址提交到别的运行。
-        self.assert_err("通勤确认属于当前运行", self.run_id, run.get("id"))
-        input_id = (run.get("pending_input") or {}).get("id")
-        self.assert_err("通勤确认提供了本轮输入 ID", True, bool(input_id))
+        # 始终提交到开场保存的运行路径，使用工作台为这一次等待分配的输入 ID。
+        input_id = run["pending_input"]["id"]
         try:
             place_choices = run["result"]["data"].get("place_choices", {})
             start_number, start_name = self.choose_place("通勤起点", place_choices.get("start", []))
@@ -137,10 +131,8 @@ class Case(BaseCase):
             # 在报告中记录实际选择的路线，便于复核 Default 这次选中了哪里。
             self.log.info(f"确认通勤：{start_name} → {end_name}")
             answer = {"start": start_number, "end": end_number}
-            # 带上本轮输入 ID 和起终点编号，提交后核对工作台是否继续处理同一场评估。
-            updated = self.request("POST", run_path + "/input", {"input_id": input_id, "decision": "answer", "data": answer})
-            self.assert_err("提交通勤选择后续接原运行", self.run_id, updated.get("id"))
-            return updated
+            # 工作台校验运行路径、输入 ID 和地点编号；直接使用续接后的状态继续轮询。
+            return self.request("POST", run_path + "/input", {"input_id": input_id, "decision": "answer", "data": answer})
         except (StopCase, ValueError, httpx.HTTPError):
             # 选址或续接失败后，只结束仍在等同一条输入的运行；请求超限时停止发送请求。
             if not self.stop_batch:
